@@ -44,11 +44,11 @@ MEDIA_BASE = "https://naedist.animemusicquiz.com/"
 LIBRARY_URL = "https://animemusicquiz.com/libraryMasterList"
 MAX_BATCH = 500
 DEFAULT_TIMEOUT = 45
-APP_VERSION = "0.1.0"
-# Set this before building the release, for example: "myname/amq-trainer".
-# The optional environment variable is useful for private/test builds.
-UPDATE_REPOSITORY = os.environ.get("AMQ_TRAINER_UPDATE_REPOSITORY", "").strip()
+APP_VERSION = "1.0.1"
+# Public GitHub repository used for release/update checks.
+UPDATE_REPOSITORY = os.environ.get("AMQ_TRAINER_UPDATE_REPOSITORY", "arpia97/AMQTrainer").strip()
 UPDATE_ASSET_NAME = "AMQTrainer.exe"
+DIRECT_SONG_COLLECTION_SOURCES = {"AMQ", "AniSongDB"}
 
 ANILIST_STATUS_NAMES = {
     "CURRENT": "Watching",
@@ -344,6 +344,77 @@ def parse_amq(path: str | Path) -> AnimeCollection:
     return AnimeCollection(source="AMQ", buckets=OrderedDict([(bucket.name, bucket)]), path=str(path), songs=songs)
 
 
+def _anisongdb_song_record(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a raw AnisongDB SongList record for the downloader/player."""
+    record = dict(raw)
+    record["linked_ids"] = dict(raw.get("linked_ids") or {})
+    record["annId"] = raw.get("annId") or raw.get("annSongId")
+    record["annSongId"] = raw.get("annSongId") or raw.get("amqSongId")
+    record["amqSongId"] = raw.get("amqSongId") or raw.get("annSongId")
+    alt_names = raw.get("animeAltName") or []
+    if isinstance(alt_names, (list, tuple)):
+        alt_names = ", ".join(_clean(name) for name in alt_names if _clean(name))
+    record["animeAltName"] = _clean(alt_names)
+    record["songCategory"] = _clean(raw.get("songCategory")) or "standard"
+    record["dub"] = raw.get("dub", raw.get("isDub", 0))
+    record["rebroadcast"] = raw.get("rebroadcast", raw.get("isRebroadcast", 0))
+    record["_source"] = "AniSongDB"
+    return record
+
+
+def parse_anisongdb(path: str | Path) -> AnimeCollection:
+    """Read the array-of-song-records JSON exported by AnisongDB."""
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        data = json.load(handle)
+    if not isinstance(data, list):
+        raise ValueError("The JSON file does not contain an AnisongDB song list.")
+
+    songs = [
+        _anisongdb_song_record(raw)
+        for raw in data
+        if isinstance(raw, dict) and (_clean(raw.get("annSongId")) or _clean(raw.get("animeENName")) or _clean(raw.get("animeJPName")))
+    ]
+    if not songs:
+        raise ValueError("The AnisongDB JSON file does not contain any usable songs.")
+
+    entries_by_key: OrderedDict[str, AnimeEntry] = OrderedDict()
+    for song in songs:
+        linked = song.get("linked_ids") or {}
+        anilist_id = linked.get("anilist")
+        mal_id = linked.get("myanimelist")
+        title_english = _clean(song.get("animeENName"))
+        title_romaji = _clean(song.get("animeJPName"))
+        title = title_english or title_romaji or "Unknown anime"
+        source_id = str(anilist_id or mal_id or title)
+        entry = AnimeEntry(
+            source_id=source_id,
+            title=title,
+            anilist_id=int(anilist_id) if anilist_id else None,
+            mal_id=int(mal_id) if mal_id else None,
+            source="AniSongDB",
+            extra={
+                "animeType": song.get("animeType"),
+                "vintage": song.get("animeVintage"),
+                "title_english": title_english,
+                "title_romaji": title_romaji,
+            },
+        )
+        entries_by_key.setdefault(entry.key, entry)
+
+    bucket = ListBucket(
+        name="AniSongDB Export",
+        kind="AniSongDB",
+        entries=list(entries_by_key.values()),
+        song_count=len(songs),
+    )
+    return AnimeCollection(
+        source="AniSongDB",
+        buckets=OrderedDict([(bucket.name, bucket)]),
+        path=str(path),
+        songs=songs,
+    )
+
+
 def parse_profile_export(data: dict[str, Any], path: str | Path) -> AnimeCollection:
     """Read an AMQ Trainer profile export produced by the profile editor."""
     if data.get("format") != "AMQ Trainer Profile Export":
@@ -383,10 +454,12 @@ def parse_export(path: str | Path) -> AnimeCollection:
             return parse_profile_export(data, path)
         if isinstance(data, dict) and isinstance(data.get("songs"), list):
             return parse_amq(path)
+        if isinstance(data, list):
+            return parse_anisongdb(path)
         return parse_anilist(path)
     if suffix == ".xml":
         return parse_mal(path)
-    raise ValueError("Choose an AniList/MAL/AMQ export (.json or .xml).")
+    raise ValueError("Choose an AniList/MAL/AMQ/AnisongDB export (.json or .xml).")
 
 
 def parse_export_group(paths: Iterable[str | Path], list_name: str) -> AnimeCollection:
@@ -403,7 +476,7 @@ def parse_export_group(paths: Iterable[str | Path], list_name: str) -> AnimeColl
     if not _clean(list_name):
         raise ValueError("A name is required for the JSON list group.")
     collections = [parse_export(path) for path in normalized_paths]
-    if any(collection.source not in {"AniList", "AMQ"} for collection in collections):
+    if any(collection.source not in {"AniList", "AMQ", "AniSongDB"} for collection in collections):
         raise ValueError("Grouped imports support JSON files only.")
 
     entries: OrderedDict[str, AnimeEntry] = OrderedDict()
@@ -640,6 +713,7 @@ SETTINGS_PATH = APP_DATA_ROOT / "settings.json"
 
 DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "settings_version": 2,
+    "patch_notes_seen_versions": [],
     "title_language": "English",
     "last_profile": "",
     "volume": 50,
@@ -728,6 +802,11 @@ def load_app_settings() -> dict[str, Any]:
         settings["session_sample_point"] = DEFAULT_APP_SETTINGS["session_sample_point"]
     for key in ("menu_autoplay", "session_opening", "session_ending", "session_insert", "session_standard", "session_character", "session_chanting", "session_instrumental", "session_other", "session_duplicate", "session_rebroadcast", "session_dub", "session_autoskip", "session_completely_random"):
         settings[key] = bool(settings.get(key, DEFAULT_APP_SETTINGS[key]))
+    seen_patch_versions = settings.get("patch_notes_seen_versions")
+    settings["patch_notes_seen_versions"] = [
+        _clean(version) for version in seen_patch_versions
+        if _clean(version)
+    ] if isinstance(seen_patch_versions, list) else []
     return settings
 
 
@@ -833,11 +912,16 @@ def count_songs_by_bucket(collection: AnimeCollection, songs: Iterable[dict[str,
 def display_bucket_type(collection: AnimeCollection, bucket: ListBucket) -> str:
     if bucket.kind == "custom":
         return "Custom List"
-    if bucket.kind == "AMQ":
-        return "AMQ"
+    if bucket.kind in DIRECT_SONG_COLLECTION_SOURCES:
+        return bucket.kind
     if collection.source in ("AniList", "MAL"):
         return collection.source
     return bucket.kind.title()
+
+
+def _collection_has_embedded_songs(collection: Optional[AnimeCollection]) -> bool:
+    """Whether the collection already contains song records and needs no API lookup."""
+    return bool(collection and collection.songs and (collection.source in DIRECT_SONG_COLLECTION_SOURCES or collection.source == "Mixed"))
 
 
 def _search_clean(value: Any, keep_special: bool = False) -> str:
@@ -1549,6 +1633,7 @@ class App:
                     "version": tag,
                     "download_url": _clean(asset.get("browser_download_url")),
                     "release_url": _clean(payload.get("html_url")),
+                    "notes": _clean(payload.get("body")),
                 }
             except Exception as exc:
                 error = str(exc)
@@ -1572,9 +1657,28 @@ class App:
                 self.messagebox.showinfo("No update available", f"You are running AMQ Trainer {APP_VERSION}.", parent=self.root)
             return
         version = release["version"]
+        seen_patch_versions = self.app_settings.setdefault("patch_notes_seen_versions", [])
+        show_patch_notes = version not in seen_patch_versions
+        if show_patch_notes:
+            notes = _clean(release.get("notes"))
+            if len(notes) > 3500:
+                notes = notes[:3500].rstrip() + "…"
+            if not notes:
+                notes = "No patch notes were provided for this release."
+            update_message = (
+                f"AMQ Trainer {version} is available.\n\n"
+                f"Patch Notes:\n{notes}\n\n"
+                "Download and install it now?"
+            )
+            # Mark this release as seen before asking, so declining the update
+            # does not cause the same patch notes to appear on every startup.
+            seen_patch_versions.append(version)
+            self._save_app_settings()
+        else:
+            update_message = f"AMQ Trainer {version} is still available. Download and install it now?"
         if self.messagebox.askyesno(
             "Update available",
-            f"AMQ Trainer {version} is available. Download and install it now?",
+            update_message,
             parent=self.root,
         ):
             self._download_and_install_update(release)
@@ -3256,7 +3360,7 @@ del "%~f0"
                     records.append(playable)
             except OSError:
                 continue
-        if not records and self.collection and self.collection.source == "AMQ":
+        if not records and _collection_has_embedded_songs(self.collection):
             for record in self.collection.songs:
                 if not self._record_enabled_for_profile(record, membership):
                     continue
@@ -4634,7 +4738,7 @@ del "%~f0"
         if not self.new_profile_mode:
             name_entry.configure(state="readonly")
 
-        file_frame = ttk.LabelFrame(surface, text="AniList/MAL/AMQ Export File")
+        file_frame = ttk.LabelFrame(surface, text="AniList/MAL/AMQ/AnisongDB Export File")
         file_frame.place(x=450, y=125, width=690, height=70)
         ttk.Entry(file_frame, textvariable=self.path_var).pack(side="left", fill="x", expand=True, padx=6, pady=6)
         ttk.Button(file_frame, text="Browse…", command=self.browse_input).pack(side="left", padx=3)
@@ -4920,7 +5024,7 @@ del "%~f0"
         self.play_stats = {}
         self.current_manifest_path = ""
         self.output_var.set(str(Path.cwd() / "downloads"))
-        self.status_var.set("Enter a profile name and choose an AniList, MAL, or AMQ export.")
+        self.status_var.set("Enter a profile name and choose an AniList, MAL, AMQ, or AnisongDB export.")
         self._build_import_screen()
 
     def _populate_lists(self) -> None:
@@ -4936,7 +5040,7 @@ del "%~f0"
             self.list_rows[name] = row
 
     def browse_input(self) -> None:
-        selected = list(self.filedialog.askopenfilenames(filetypes=[("AniList / MAL / AMQ exports", "*.json *.xml"), ("All files", "*.*")]))
+        selected = list(self.filedialog.askopenfilenames(filetypes=[("AniList / MAL / AMQ / AnisongDB exports", "*.json *.xml"), ("All files", "*.*")]))
         if not selected:
             return
         if len(selected) > 1 and any(Path(path).suffix.lower() != ".json" for path in selected):
@@ -5036,7 +5140,7 @@ del "%~f0"
         return minimum <= year <= maximum and (season_filter == "All" or season_filter == season)
 
     def _matching_songs(self, entries: list[AnimeEntry], types: list[str], categories: list[str], snapshot: Optional[tuple[int, int, str]] = None) -> list[dict[str, Any]]:
-        if self.collection and self.collection.source == "AMQ":
+        if _collection_has_embedded_songs(self.collection):
             keys = {entry.key for entry in entries}
             matching: list[dict[str, Any]] = []
             for song in self.collection.songs:
@@ -5104,7 +5208,7 @@ del "%~f0"
             self.messagebox.showwarning("No song filters selected", "Select at least one song type and one category.", parent=self.root)
             return
         snapshot = self._filter_snapshot()
-        if self.collection.source == "AMQ":
+        if _collection_has_embedded_songs(self.collection):
             for bucket in self.collection.buckets.values():
                 bucket.song_count = len(self._matching_songs(bucket.entries, types, categories, snapshot))
             self._update_rows("AMQ song counts loaded without AnisongDB requests.")
@@ -5562,11 +5666,11 @@ del "%~f0"
         self.tk.Label(surface, text="Add List", bg=UI_BACKGROUND, fg=UI_TEXT, font=(self._ui_font_family, 24, "bold")).pack(pady=(21, 18))
         selected_paths: list[str] = []
         display_var = self.tk.StringVar()
-        file_frame = self.ttk.LabelFrame(surface, text="AniList/MAL/AMQ Export File")
+        file_frame = self.ttk.LabelFrame(surface, text="AniList/MAL/AMQ/AnisongDB Export File")
         file_frame.pack(fill="x", padx=40, pady=6)
         self.ttk.Entry(file_frame, textvariable=display_var).pack(side="left", fill="x", expand=True, padx=7, pady=8)
         def browse() -> None:
-            paths = list(self.filedialog.askopenfilenames(filetypes=[("AniList / MAL / AMQ exports", "*.json *.xml"), ("All files", "*.*")]))
+            paths = list(self.filedialog.askopenfilenames(filetypes=[("AniList / MAL / AMQ / AnisongDB exports", "*.json *.xml"), ("All files", "*.*")]))
             if not paths:
                 return
             if len(paths) > 1 and any(Path(path).suffix.lower() != ".json" for path in paths):
@@ -6062,7 +6166,7 @@ def cli_main(args: argparse.Namespace) -> int:
         client = AnisongDBClient()
         types = list(SONG_TYPES)
         categories = list(SONG_CATEGORIES)
-        songs = collection.songs if collection.source == "AMQ" else client.songs_for_entries(collection.all_entries(), types, categories)
+        songs = collection.songs if _collection_has_embedded_songs(collection) else client.songs_for_entries(collection.all_entries(), types, categories)
         totals = count_songs_by_bucket(collection, songs)
         print("\nSong totals:")
         for bucket in collection.buckets.values():
