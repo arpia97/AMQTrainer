@@ -1737,6 +1737,8 @@ class App:
         script_path = Path(tempfile.gettempdir()) / f"AMQTrainer-updater-{os.getpid()}.cmd"
         source_text = str(temporary).replace('"', "")
         target_text = str(target).replace('"', "")
+        staged_text = str(target.with_name(f".AMQTrainer-{os.getpid()}.new.exe")).replace('"', "")
+        target_dir_text = str(target.parent).replace('"', "")
         script = f'''@echo off
 setlocal
 :wait_for_app
@@ -1745,8 +1747,21 @@ if not errorlevel 1 (
   timeout /t 1 /nobreak >nul
   goto wait_for_app
 )
-move /Y "{source_text}" "{target_text}" >nul
-start "" "{target_text}"
+timeout /t 1 /nobreak >nul
+:stage_update
+copy /Y "{source_text}" "{staged_text}" >nul
+if errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto stage_update
+)
+:replace_update
+move /Y "{staged_text}" "{target_text}" >nul
+if errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto replace_update
+)
+del "{source_text}" >nul 2>&1
+start "" /D "{target_dir_text}" "{target_text}"
 del "%~f0"
 '''
         try:
