@@ -1657,25 +1657,16 @@ class App:
                 self.messagebox.showinfo("No update available", f"You are running AMQ Trainer {APP_VERSION}.", parent=self.root)
             return
         version = release["version"]
-        seen_patch_versions = self.app_settings.setdefault("patch_notes_seen_versions", [])
-        show_patch_notes = version not in seen_patch_versions
-        if show_patch_notes:
-            notes = _clean(release.get("notes"))
-            if len(notes) > 3500:
-                notes = notes[:3500].rstrip() + "…"
-            if not notes:
-                notes = "No patch notes were provided for this release."
-            update_message = (
-                f"AMQ Trainer {version} is available.\n\n"
-                f"Patch Notes:\n{notes}\n\n"
-                "Download and install it now?"
-            )
-            # Mark this release as seen before asking, so declining the update
-            # does not cause the same patch notes to appear on every startup.
-            seen_patch_versions.append(version)
-            self._save_app_settings()
-        else:
-            update_message = f"AMQ Trainer {version} is still available. Download and install it now?"
+        notes = _clean(release.get("notes"))
+        if len(notes) > 3500:
+            notes = notes[:3500].rstrip() + "…"
+        if not notes:
+            notes = "No patch notes were provided for this release."
+        update_message = (
+            f"AMQ Trainer {version} is available.\n\n"
+            f"Patch Notes:\n{notes}\n\n"
+            "Download and install it now?"
+        )
         if self.messagebox.askyesno(
             "Update available",
             update_message,
@@ -1739,6 +1730,8 @@ class App:
         target_text = str(target).replace('"', "")
         staged_text = str(target.with_name(f".AMQTrainer-{os.getpid()}.new.exe")).replace('"', "")
         target_dir_text = str(target.parent).replace('"', "")
+        powershell_target = target_text.replace("'", "''")
+        powershell_directory = target_dir_text.replace("'", "''")
         script = f'''@echo off
 setlocal
 :wait_for_app
@@ -1748,6 +1741,7 @@ if not errorlevel 1 (
   goto wait_for_app
 )
 timeout /t 1 /nobreak >nul
+timeout /t 4 /nobreak >nul
 :stage_update
 copy /Y "{source_text}" "{staged_text}" >nul
 if errorlevel 1 (
@@ -1761,7 +1755,16 @@ if errorlevel 1 (
   goto replace_update
 )
 del "{source_text}" >nul 2>&1
-start "" /D "{target_dir_text}" "{target_text}"
+set launch_attempts=0
+:launch_update
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; try {{ $p=Start-Process -FilePath '{powershell_target}' -WorkingDirectory '{powershell_directory}' -PassThru -Wait; exit [int]$p.ExitCode }} catch {{ exit 9009 }}"
+if %ERRORLEVEL% EQU 0 goto finish_update
+set /a launch_attempts+=1
+if %launch_attempts% GEQ 3 goto finish_update
+timeout /t 2 /nobreak >nul
+goto launch_update
+:finish_update
 del "%~f0"
 '''
         try:
